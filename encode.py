@@ -77,7 +77,7 @@ class MultiprocessingEncoder(object):
 
     def initializer(self):
         global bpe
-        bpe = BertTokenizer.from_pretrained('pretrained_model/bert_uncased_base_vocab.txt')
+        bpe = BertTokenizer.from_pretrained('pretrained_model/prophetnet_chinese_dict/vocab_for_huggingface.txt')
 
     def encode(self, line):
         global bpe
