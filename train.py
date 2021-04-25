@@ -14,7 +14,7 @@ import random
 import numpy as np
 import torch
 
-from mass.trainer import Trainer
+from prophetnet.trainer import Trainer
 from fairseq import checkpoint_utils, distributed_utils, options, progress_bar, tasks, utils
 from fairseq.data import iterators
 from fairseq.meters import AverageMeter, StopwatchMeter

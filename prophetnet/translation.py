@@ -752,7 +752,7 @@ class SummDAETranslationTask(FairseqTask):
             return SequenceScorer(self.target_dictionary)
         else:
             from fairseq.sequence_generator import SequenceGeneratorWithAlignment
-            from mass.sequence_generator import SequenceGenerator
+            from prophetnet.sequence_generator import SequenceGenerator
             if getattr(args, 'print_alignment', False):
                 seq_gen_cls = SequenceGeneratorWithAlignment
             else:
@@ -781,7 +781,7 @@ class SummDAETranslationTask(FairseqTask):
         return BertDictionary.load_from_file(filename)
 
     def build_generator_cls(self, args):
-        from mass.sequence_generator import SequenceGenerator
+        from prophetnet.sequence_generator import SequenceGenerator
         return SequenceGenerator(
             self.target_dictionary,
             beam_size=getattr(args, 'beam', 1),

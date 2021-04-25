@@ -23,7 +23,7 @@ MODEL=$MODEL_DIR/checkpoint_best.pt
 
 fairseq-generate $DATA_DIR \
         --path $MODEL \
-        --user-dir mass \
+        --user-dir prophetnet \
         --task translation_mix \
         --model_lang_pairs src-tgt $STYLE-$STYLE \
         --lang-pairs src-tgt \

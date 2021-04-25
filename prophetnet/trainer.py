@@ -244,10 +244,8 @@ class Trainer(object):
             dataset=self.task.dataset(self.args.train_subset),
             max_tokens=self.args.max_tokens,
             max_sentences=self.args.max_sentences,
-            max_positions=utils.resolve_max_positions(
+            max_positions=
                 self.task.max_positions(),
-                self.model.max_positions(),
-            ),
             ignore_invalid_inputs=True,
             required_batch_size_multiple=self.args.required_batch_size_multiple,
             seed=self.args.seed,
