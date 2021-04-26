@@ -1768,7 +1768,7 @@ def transformer_middle(args):
     args.decoder_layers = getattr(args, 'decoder_layers', 6)
     transformer_base(args)
 
-
+@register_model_architecture('mix_ngram_transformer_prophet', 'ngram_transformer_prophet_large_mix')
 @register_model_architecture('ngram_transformer_prophet', 'ngram_transformer_prophet_large')
 def transformer_big(args):
     args.ngram = getattr(args, 'ngram', 2)
