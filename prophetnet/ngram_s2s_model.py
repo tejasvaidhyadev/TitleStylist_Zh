@@ -9,16 +9,23 @@ from fairseq.models import (
     FairseqEncoder,
     FairseqIncrementalDecoder,
     FairseqEncoderDecoderModel,
+    FairseqLanguageModel,
     register_model,
     register_model_architecture,
 )
 from fairseq.modules import (
     MultiheadAttention,
     LayerNorm,
+    AdaptiveInput,
+    CharacterTokenEmbedder,
+    SinusoidalPositionalEmbedding,
+    PositionalEmbedding,
+    AdaptiveSoftmax,
 )
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
 from .learned_positional_embedding import LearnedPositionalEmbedding
 from .ngram_multihead_attention import NgramMultiheadAttention, ngram_attention_bias
+from .multihead_attention import MultiheadAttention as localMultiheadAttention
 
 DEFAULT_MAX_SOURCE_POSITIONS = 512
 DEFAULT_MAX_TARGET_POSITIONS = 512
@@ -220,6 +227,248 @@ class NgramTransformerProphetModel(FairseqEncoderDecoderModel):
         decoder_out = self.decoder(prev_output_tokens, encoder_out=encoder_out, **kwargs)
         return decoder_out
 
+@register_model('mix_ngram_transformer_prophet')
+class mixNgramTransformerProphetModel(FairseqEncoderDecoderModel):
+    """
+    Args:
+        encoder (TransformerEncoder): the encoder
+        decoder (TransformerDecoder): the decoder
+    The Transformer model provides the following named architectures and
+    command-line arguments:
+    .. argparse::
+        :ref: fairseq.models.transformer_parser
+        :prog:
+    """
+
+    def __init__(self, encoder, decoder):
+        super().__init__(encoder, decoder)
+
+    @staticmethod
+    def add_args(parser):
+        """Add model-specific arguments to the parser."""
+        parser.add_argument('--ngram', type=int, metavar='N',
+                            help='num of predicting grams')
+        parser.add_argument('--num_buckets', type=int, metavar='N',
+                            help='num of buckets for relative position')
+        parser.add_argument('--relative_max_distance', type=int, metavar='N',
+                            help='num of bucket for relative position')
+        # fmt: off
+        parser.add_argument('--activation-fn',
+                            choices=utils.get_available_activation_fns(),
+                            help='activation function to use')
+        parser.add_argument('--dropout', type=float, metavar='D',
+                            help='dropout probability')
+        parser.add_argument('--attention-dropout', type=float, metavar='D',
+                            help='dropout probability for attention weights')
+        parser.add_argument('--activation-dropout', type=float, metavar='D',
+                            help='dropout probability after activation in FFN.')
+
+        parser.add_argument('--encoder-embed-dim', type=int, metavar='N',
+                            help='encoder embedding dimension')
+        parser.add_argument('--encoder-ffn-embed-dim', type=int, metavar='N',
+                            help='encoder embedding dimension for FFN')
+        parser.add_argument('--encoder-layers', type=int, metavar='N',
+                            help='num encoder layers')
+        parser.add_argument('--encoder-attention-heads', type=int, metavar='N',
+                            help='num encoder attention heads')
+
+        parser.add_argument('--decoder-embed-dim', type=int, metavar='N',
+                            help='decoder embedding dimension')
+        parser.add_argument('--decoder-ffn-embed-dim', type=int, metavar='N',
+                            help='decoder embedding dimension for FFN')
+        parser.add_argument('--decoder-layers', type=int, metavar='N',
+                            help='num decoder layers')
+        parser.add_argument('--decoder-attention-heads', type=int, metavar='N',
+                            help='num decoder attention heads')
+
+        parser.add_argument('--share-all-embeddings', action='store_true',
+                            help='share encoder, decoder and output embeddings'
+                                 ' (requires shared dictionary and embed dim)')
+        parser.add_argument('--load-from-pretrained-model', type=str, default=None,
+                            help='Load from pretrained model')
+        parser.add_argument('--load-sep', action='store_true',
+                            help='load pretrained [SEP] weight into [X_SEP]. ([SEP] used as eos in fine tuning)')
+        # fmt: on
+
+    def get_normalized_probs(self, net_output, log_probs, sample=None):
+        """Get normalized probabilities (or log probs) from a net's output."""
+        if hasattr(self, 'decoder'):
+            return self.decoder.get_normalized_probs(net_output, log_probs, sample)
+        elif torch.is_tensor(net_output):
+            logits = net_output.float()
+            if log_probs:
+                return F.log_softmax(logits, dim=-1)
+            else:
+                return F.softmax(logits, dim=-1)
+        raise NotImplementedError
+
+    @classmethod
+    def build_model(cls, args, task):
+        """Build a new model instance."""
+
+        # make sure all arguments are present in older models
+        base_architecture(args)
+
+        if not hasattr(args, 'max_source_positions'):
+            args.max_source_positions = DEFAULT_MAX_SOURCE_POSITIONS
+        if not hasattr(args, 'max_target_positions'):
+            args.max_target_positions = DEFAULT_MAX_TARGET_POSITIONS
+
+        src_dict, tgt_dict = task.source_dictionary, task.target_dictionary
+
+        def build_embedding(dictionary, embed_dim):
+            num_embeddings = len(dictionary)
+            padding_idx = dictionary.pad()
+            emb = Embedding(num_embeddings, embed_dim, padding_idx)
+            return emb
+
+        if args.share_all_embeddings:
+            if src_dict != tgt_dict:
+                raise ValueError('--share-all-embeddings requires a joined dictionary')
+            if args.encoder_embed_dim != args.decoder_embed_dim:
+                raise ValueError(
+                    '--share-all-embeddings requires --encoder-embed-dim to match --decoder-embed-dim')
+            encoder_embed_tokens = build_embedding(
+                src_dict, args.encoder_embed_dim
+            )
+            decoder_embed_tokens = encoder_embed_tokens
+            args.share_decoder_input_output_embed = True
+        else:
+            encoder_embed_tokens = build_embedding(
+                src_dict, args.encoder_embed_dim
+            )
+            decoder_embed_tokens = build_embedding(
+                tgt_dict, args.decoder_embed_dim
+            )
+
+        encoder = TransformerEncoder(args, src_dict, encoder_embed_tokens)
+        #decoder = NgramTransformerDecoder(args, tgt_dict, decoder_embed_tokens)
+        decoder = NgramTransformermixDecoder(args, tgt_dict, decoder_embed_tokens)
+
+        model = mixNgramTransformerProphetModel(encoder, decoder)
+
+        if args.load_from_pretrained_model is not None:
+            states = torch.load(args.load_from_pretrained_model, map_location='cpu')
+            if 'model' in states and 'args' in states:
+                states = states['model']
+            if args.load_sep:
+                encoder_token_weight = states['encoder.embed_tokens.weight']
+                decoder_token_weight = states['decoder.embed_tokens.weight']
+                encoder_token_weight[2] = encoder_token_weight[102]
+                decoder_token_weight[2] = decoder_token_weight[102]
+                states['encoder.embed_tokens.weight'] = encoder_token_weight
+                states['decoder.embed_tokens.weight'] = decoder_token_weight
+
+            # now we need to manipulate the states
+            num_decoder_output_types = len(args.model_lang_pairs)
+
+            new_states = OrderedDict()
+            layers_to_copy = []
+            if options.eval_bool(args.divide_decoder_self_attn_norm):
+                layers_to_copy.append('self_attn_layer_norm')
+            if options.eval_bool(args.divide_decoder_embed_norm):
+                layers_to_copy.append('emb_layer_norm')
+            if options.eval_bool(args.divide_decoder_final_norm):
+                layers_to_copy.append('final_layer_norm')
+            if options.eval_bool(args.divide_decoder_encoder_attn_norm):
+                layers_to_copy.append('encoder_attn_layer_norm')
+            if options.eval_bool(args.divide_decoder_self_attn_query):
+                layers_to_copy.append('self_attn.in_proj')
+            if options.eval_bool(args.divide_decoder_encoder_attn_query):
+                layers_to_copy.append('encoder_attn.in_proj')
+
+            for k, v in states.items():
+                if 'decoder' in k and any(item in k for item in layers_to_copy):
+                    layer_idx = k.split('.')[2]
+                    suffix = k.split('.')[-1] if 'in_proj' not in k else k.split('_')[-1]
+                    layer_name = k.split('.')[-2]
+                    for type_idx in range(num_decoder_output_types):
+                        if 'emb_layer_norm' in k:
+                            new_states['decoder.{}.{}.{}'.format(layer_name, type_idx, suffix)] \
+                                = copy.deepcopy(v)
+                        else:
+                            if 'in_proj' in k:
+                                dim = int(v.shape[0] / 3)
+                                new_states['decoder.layers.{}.{}.q_proj.{}.{}'.format(layer_idx, layer_name, type_idx, suffix)] \
+                                    = copy.deepcopy(v[:dim])
+                                new_states[
+                                    'decoder.layers.{}.{}.k_proj.{}'.format(layer_idx, layer_name, suffix)] \
+                                    = copy.deepcopy(v[dim:2*dim])
+                                new_states[
+                                    'decoder.layers.{}.{}.v_proj.{}'.format(layer_idx, layer_name, suffix)] \
+                                    = copy.deepcopy(v[2*dim:])
+                            else:
+                                new_states['decoder.layers.{}.{}.{}.{}'.format(layer_idx, layer_name, type_idx, suffix)] \
+                                    = copy.deepcopy(v)
+                else:
+                    new_states[k] = v
+            del states
+
+            loaded_dict_size = new_states['encoder.embed_tokens.weight'].size(0)
+            num_langids_to_add = len(encoder.dictionary) - loaded_dict_size
+            embed_dim = new_states['encoder.embed_tokens.weight'].size(1)
+
+            if num_langids_to_add > 0:
+                new_lang_embed_to_add = torch.zeros(num_langids_to_add, embed_dim)
+                nn.init.normal_(
+                    new_lang_embed_to_add,
+                    mean=0,
+                    std=embed_dim ** -0.5
+                )
+                new_lang_embed_to_add = new_lang_embed_to_add.to(
+                    dtype=new_states['encoder.embed_tokens.weight'].dtype,
+                )
+
+                new_states['encoder.embed_tokens.weight'] = torch.cat([
+                    new_states['encoder.embed_tokens.weight'],
+                    new_lang_embed_to_add]
+                )
+                new_states['decoder.embed_tokens.weight'] = torch.cat([
+                    new_states['decoder.embed_tokens.weight'],
+                    new_lang_embed_to_add]
+                )
+                
+            for position_name, target_position_length in [('encoder.embed_positions.weight', model.encoder.embed_positions.weight.size(0)), \
+                    ('decoder.embed_positions.weight', model.decoder.embed_positions.weight.size(0))]:
+                if new_states[position_name].size(0) < target_position_length:
+                    _index = torch.arange(new_states[position_name].size(1))
+                    expend_position_states = new_states[position_name].clone()
+                    while states[position_name].size(0) < target_position_length:
+                        _index = torch.cat((_index[1:],_index[:1]), dim=0)
+                        new_states[position_name] = torch.cat([new_states[position_name], expend_position_states[:,_index]], dim=0)
+                if new_states[position_name].size(0) > target_position_length:
+                    new_states[position_name] = new_states[position_name][:target_position_length]
+            model.load_state_dict(new_states)
+            args.load_from_pretrained_model = None  # Clear this param
+
+        return NgramTransformerProphetModel(encoder, decoder)
+
+    def max_positions(self):
+        return (self.encoder.max_positions(), self.decoder.max_positions())
+
+    def forward(self, src_tokens=None, src_lengths=None, prev_output_tokens=None, **kwargs):
+        """
+        Run the forward pass for an encoder-decoder model.
+        First feed a batch of source tokens through the encoder. Then, feed the
+        encoder output and previous decoder outputs (i.e., teacher forcing) to
+        the decoder to produce the next outputs::
+            encoder_out = self.encoder(src_tokens, src_lengths)
+            return self.decoder(prev_output_tokens, encoder_out)
+        Args:
+            src_tokens (LongTensor): tokens in the source language of shape
+                `(batch, src_len)`
+            src_lengths (LongTensor): source sentence lengths of shape `(batch)`
+            prev_output_tokens (LongTensor): previous decoder outputs of shape
+                `(batch, tgt_len)`, for teacher forcing
+        Returns:
+            tuple:
+                - the decoder's output of shape `(batch, tgt_len, vocab)`
+                - a dictionary with any model-specific outputs
+        """
+        encoder_out = self.encoder(src_tokens, src_lengths=src_lengths, **kwargs)
+        decoder_out = self.decoder(prev_output_tokens, encoder_out=encoder_out, **kwargs)
+        return decoder_out
+
 
 class TransformerEncoderLayer(nn.Module):
     """
@@ -296,6 +545,279 @@ class TransformerEncoderLayer(nn.Module):
         x = residual + x
         x = self.final_layer_norm(x)
         return x, attn
+
+class NgramTransformermixDecoderLayer(nn.Module):
+    def __init__(
+            self,
+            ngram=2,
+            embedding_dim: float = 768,
+            ffn_embedding_dim: float = 3072,
+            num_attention_heads: float = 8,
+            dropout: float = 0.1,
+            attention_dropout: float = 0.1,
+            activation_dropout: float = 0.1,
+            activation_fn: str = 'relu',
+            add_bias_kv: bool = False,
+            add_zero_attn: bool = False,
+            export: bool = False, no_encoder_attn=False, add_bias_kv=False, add_zero_attn=False,
+                 no_train_encoder_attn=False
+
+    ):
+        super().__init__()
+
+        self.embedding_dim = embedding_dim
+        self.dropout = dropout
+        self.activation_dropout = activation_dropout
+
+        decoder_output_types, decoder_input_types = [], []
+        decoder_output_types += [item.split('-')[-1] for item in args.model_lang_pairs]
+        decoder_input_types += [item.split('-')[0] for item in args.model_lang_pairs]
+        self.divide_decoder_self_attn_norm = options.eval_bool(args.divide_decoder_self_attn_norm)
+        self.divide_decoder_final_norm = options.eval_bool(args.divide_decoder_final_norm)
+        self.divide_decoder_encoder_attn_norm = options.eval_bool(args.divide_decoder_encoder_attn_norm)
+
+               # check whether we divide the self-attn and encoder-attn query
+        self.divide_decoder_self_attn_query = options.eval_bool(args.divide_decoder_self_attn_query)
+        self.divide_decoder_encoder_attn_query = options.eval_bool(args.divide_decoder_encoder_attn_query)
+
+        self.embed_dim = args.decoder_embed_dim
+        self.cross_self_attention = getattr(args, 'cross_self_attention', False)
+        if self.divide_decoder_self_attn_query:
+            self.self_attn = localMultiheadAttention(
+                embed_dim=self.embed_dim,
+                num_heads=args.decoder_attention_heads,
+                dropout=args.attention_dropout,
+                add_bias_kv=add_bias_kv,
+                add_zero_attn=add_zero_attn,
+                self_attention=not self.cross_self_attention,
+                tgt_types=self.decoder_output_types_dict,
+                enable_torch_version=False,
+            )
+        else:
+            self.ngram_self_attn = NgramMultiheadAttention(
+                self.embedding_dim,
+                num_attention_heads,
+                dropout=attention_dropout,
+                add_bias_kv=add_bias_kv,
+                add_zero_attn=add_zero_attn,
+                self_attention=True,
+                ngram=ngram
+        )
+    
+        # Initialize blocks
+        self.activation_fn = utils.get_activation_fn(activation_fn)
+        self.ngram = ngram
+                    activation=getattr(args, 'activation_fn', 'relu')
+        )
+        self.activation_dropout = getattr(args, 'activation_dropout', 0)
+        if self.activation_dropout == 0:
+            # for backwards compatibility with models that use args.relu_dropout
+            self.activation_dropout = getattr(args, 'relu_dropout', 0)
+        self.normalize_before = args.decoder_normalize_before
+
+
+        # layer norm associated with the self attention layer
+        if self.divide_decoder_self_attn_norm:
+            self.self_attn_layer_norm = nn.ModuleList([LayerNorm(self.embed_dim, export=export)
+                                                       for _ in range(len(decoder_output_types))])
+        else:
+            self.self_attn_layer_norm = LayerNorm(self.embed_dim, export=export)
+
+
+        if no_encoder_attn:
+            self.encoder_attn = None
+            self.encoder_attn_layer_norm = None
+        else:
+            if self.divide_decoder_encoder_attn_query:
+                self.encoder_attn = localMultiheadAttention(
+                    self.embed_dim,
+                    args.decoder_attention_heads,
+                    kdim=getattr(args, 'encoder_embed_dim', None),
+                    vdim=getattr(args, 'encoder_embed_dim', None),
+                    dropout=args.attention_dropout,
+                    encoder_decoder_attention=True,
+                    tgt_types=self.decoder_input_types_dict,
+                    enable_torch_version=False,
+                )
+            else:
+                self.encoder_attn = MultiheadAttention(
+                    self.embed_dim,
+                    args.decoder_attention_heads,
+                    kdim=getattr(args, 'encoder_embed_dim', None),
+                    vdim=getattr(args, 'encoder_embed_dim', None),
+                    dropout=args.attention_dropout,
+                    encoder_decoder_attention=True,
+                )
+            if self.divide_decoder_encoder_attn_norm:
+                self.encoder_attn_layer_norm = nn.ModuleList([LayerNorm(self.embed_dim, export=export)
+                                                              for _ in range(len(decoder_input_types))])
+            else:
+                self.encoder_attn_layer_norm = LayerNorm(self.embed_dim, export=export)
+        self.no_train_encoder_attn = no_train_encoder_attn
+
+
+        self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
+        self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
+
+        # layer norm associated with the position wise feed-forward NN
+        if self.divide_decoder_final_norm:
+            self.final_layer_norm = nn.ModuleList([LayerNorm(self.embed_dim, export=export)
+                                                   for _ in range(len(decoder_output_types))])
+        else:
+            self.final_layer_norm = LayerNorm(self.embed_dim, export=export)
+        self.need_attn = True
+
+        self.need_attn = False
+
+
+    def forward(
+            self,
+            x,
+            encoder_out=None,
+            encoder_mask=None,
+            incremental_state=None,
+            prev_self_attn_state=None,
+            prev_attn_state=None,
+            self_attn_mask=None,
+            ngram_mask_matrix=None,
+            i_buckets_main_stream=None,
+            i_bucket_relative_stream=None,
+            real_positions=None,
+            lang_pair=None,
+    ):
+        src, tgt = lang_pair.split('-')
+        # one main stream and ngram predicting streams
+        residual = x
+        x = self.maybe_layer_norm(self.self_attn_layer_norm, x, before=True)
+
+        if prev_self_attn_state is not None:
+            if incremental_state is None:
+                incremental_state = {}
+            prev_key, prev_value = prev_self_attn_state
+            saved_state = {"prev_key": prev_key, "prev_value": prev_value}
+            self.self_attn._set_input_buffer(incremental_state, saved_state)
+
+        x, attn = self.ngram_self_attn(
+            query=x,
+            key=x,
+            value=x,
+            incremental_state=incremental_state,
+            need_weights=False,
+            self_attn_mask=self_attn_mask,
+            ngram_mask_matrix=ngram_mask_matrix,
+            i_buckets_main_stream=i_buckets_main_stream,
+            i_bucket_relative_stream=i_bucket_relative_stream,
+            real_positions=real_positions
+        )
+        
+        if self.divide_decoder_self_attn_query:
+            x, attn = self.self_attn(
+                query=x,
+                key=y,
+                value=y,
+                key_padding_mask=self_attn_padding_mask,
+                incremental_state=incremental_state,
+                need_weights=False,
+                attn_mask=self_attn_mask,
+                tgt_type=tgt,
+            )
+        else:
+            x, attn = self.self_attn(
+                query=x,
+                key=y,
+                value=y,
+                key_padding_mask=self_attn_padding_mask,
+                incremental_state=incremental_state,
+                need_weights=False,
+                attn_mask=self_attn_mask,
+            )
+
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = residual + x
+        if self.divide_decoder_self_attn_norm:
+            x = self.maybe_layer_norm(self.self_attn_layer_norm[self.decoder_output_types_dict[tgt]], x, after=True)
+        else:
+            x = self.maybe_layer_norm(self.self_attn_layer_norm, x, after=True)
+        if self.encoder_attn is not None and not self.no_train_encoder_attn:
+            residual = x
+            x = self.maybe_layer_norm(self.encoder_attn_layer_norm, x, before=True)
+            if prev_attn_state is not None:
+                if incremental_state is None:
+                    incremental_state = {}
+                prev_key, prev_value = prev_attn_state[:2]
+                saved_state = {"prev_key": prev_key, "prev_value": prev_value}
+                if len(prev_attn_state) >= 3:
+                    saved_state["prev_key_padding_mask"] = prev_attn_state[2]
+                self.encoder_attn._set_input_buffer(incremental_state, saved_state)
+
+            if self.divide_decoder_encoder_attn_query:
+                x, attn = self.encoder_attn(
+                    query=x,
+                    key=encoder_out,
+                    value=encoder_out,
+                    key_padding_mask=encoder_padding_mask,
+                    incremental_state=incremental_state,
+                    static_kv=True,
+                    tgt_type=src,
+                )
+            else:
+                x, attn = self.encoder_attn(
+                    query=x,
+                    key=encoder_out,
+                    value=encoder_out,
+                    key_padding_mask=encoder_padding_mask,
+                    incremental_state=incremental_state,
+                    static_kv=True,
+                )
+
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = residual + x
+            if self.divide_decoder_encoder_attn_norm:
+                x = self.maybe_layer_norm(self.encoder_attn_layer_norm[self.decoder_input_types_dict[src]], x,
+                                                                       after=True)
+            else:
+                x = self.maybe_layer_norm(self.encoder_attn_layer_norm, x, after=True)
+
+        residual = x
+        x = self.maybe_layer_norm(self.final_layer_norm, x, before=True)
+        x = self.activation_fn(self.fc1(x))
+        x = F.dropout(x, p=self.activation_dropout, training=self.training)
+        x = self.fc2(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = residual + x
+
+        if self.divide_decoder_final_norm:
+            x = self.maybe_layer_norm(self.final_layer_norm[self.decoder_output_types_dict[tgt]], x, after=True)
+        else:
+            x = self.maybe_layer_norm(self.final_layer_norm, x, after=True)
+
+        if self.onnx_trace and incremental_state is not None:
+            saved_state = self.self_attn._get_input_buffer(incremental_state)
+            if self_attn_padding_mask is not None:
+                self_attn_state = saved_state["prev_key"], saved_state["prev_value"], saved_state["prev_key_padding_mask"]
+            else:
+                self_attn_state = saved_state["prev_key"], saved_state["prev_value"]
+            return x, attn, self_attn_state
+        return x, attn
+
+
+    def maybe_layer_norm(self, layer_norm, x, before=False, after=False):
+        assert before ^ after
+        if after ^ self.normalize_before:
+            return layer_norm(x)
+        else:
+            return x
+
+    def make_generation_fast_(self, need_attn=False, **kwargs):
+        self.need_attn = need_attn
+
+
+def Linear(in_features, out_features, bias=True):
+    m = nn.Linear(in_features, out_features, bias)
+    nn.init.xavier_uniform_(m.weight)
+    if bias:
+        nn.init.constant_(m.bias, 0.)
+    return m
 
 
 class NgramTransformerDecoderLayer(nn.Module):
@@ -542,6 +1064,322 @@ class TransformerEncoder(FairseqEncoder):
             return self.max_source_positions
         return min(self.max_source_positions, self.embed_positions.max_positions())
 
+class NgramTransformermixDecoder(nn.Module):
+   """
+    Transformer decoder consisting of *args.decoder_layers* layers. Each layer
+    is a :class:`TransformerDecoderLayer`.
+    Args:
+        args (argparse.Namespace): parsed command-line arguments
+        dictionary (~fairseq.data.Dictionary): decoding dictionary
+        embed_tokens (torch.nn.Embedding): output embedding
+        no_encoder_attn (bool, optional): whether to attend to encoder outputs
+            (default: False).
+    """
+
+    def __init__(self, args, dictionary, embed_tokens, no_encoder_attn=False):
+        super().__init__(dictionary)
+        self.register_buffer('version', torch.Tensor([3]))
+        self.ngram = args.ngram
+        self.num_buckets = args.num_buckets
+        self.relative_max_distance = args.relative_max_distance
+
+        self.dropout = args.dropout
+        self.share_input_output_embed = args.share_decoder_input_output_embed
+
+        input_embed_dim = embed_tokens.embedding_dim
+        embed_dim = args.decoder_embed_dim
+
+        self.padding_idx = embed_tokens.padding_idx
+        self.max_target_positions = args.max_target_positions
+        self.embed_dim = embed_dim
+        self.embed_tokens = embed_tokens
+        self.embed_scale = None #math.sqrt(embed_dim)  # todo: try with input_embed_dim
+
+        self.embed_positions = LearnedPositionalEmbedding(
+            args.max_target_positions + 2 + self.padding_idx, embed_dim, self.padding_idx,
+        )
+
+        self.ngram_input_embed = Embedding(self.ngram, input_embed_dim, None)
+
+        self.layers = nn.ModuleList([])
+
+        self.layers.extend([
+            NgramTransformermixDecoderLayer(
+                args.ngram,
+                args.decoder_embed_dim,
+                args.decoder_ffn_embed_dim,
+                args.decoder_attention_heads,
+                args.dropout,
+                args.attention_dropout,
+                args.activation_dropout,
+                args.activation_fn,
+
+            )
+            for _ in range(args.decoder_layers)
+        ])
+
+        if not self.share_input_output_embed:
+            self.embed_out = nn.Parameter(torch.Tensor(len(dictionary), self.embed_dim))
+            nn.init.normal_(self.embed_out, mean=0, std=self.embed_dim ** -0.5)
+
+        self.emb_layer_norm = LayerNorm(embed_dim)
+        self.apply(init_bert_params)
+
+    def forward(self,
+                prev_output_tokens,
+                encoder_out=None,
+                incremental_state=None,
+                **unused):
+        # T
+        T = prev_output_tokens.size(1)
+        # x [B, (1+ngram)*T, C]
+        x_list, extra = self.extract_features(prev_output_tokens, encoder_out, incremental_state, **unused)
+        x_predicted = x_list[1:]
+        x_predicted = [self.output_layer(x) for x in x_predicted]
+        if incremental_state is not None:
+            x_predicted = x_predicted[0]
+            for k in extra:
+                if extra[k] is not None:
+                    extra[k] = extra[k][0]
+        return x_predicted, extra
+
+    def _relative_positions_bucket(self, relative_positions, bidirectional=False):
+        num_buckets = self.num_buckets
+        max_distance = self.relative_max_distance
+        n = -relative_positions
+        result = 0
+        if bidirectional:
+            num_buckets = num_buckets // 2
+            result = result + torch.lt(n, torch.zeros_like(n)).int() * num_buckets
+            n = torch.abs(n)
+        else:
+            n = torch.max(n, torch.zeros_like(n))
+        max_exact = num_buckets // 2
+        is_small = torch.lt(n, max_exact)
+        val_if_large = max_exact + torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (
+                num_buckets - max_exact)
+        val_if_large = torch.min(val_if_large, torch.ones_like(val_if_large) * (num_buckets - 1))
+        val_if_large = val_if_large.int()
+        result = result + torch.where(is_small, n.int(), val_if_large)
+        return result
+
+    def cal_pretrain_relative_positions(self, real_positions):
+        # main stream
+        main_stream_relative_positions = real_positions.unsqueeze(1)
+        # [B,T,T/S]
+        main_stream_relative_positions = main_stream_relative_positions.repeat(1, real_positions.size(-1), 1)
+        # [B,T,1]
+        real_positions_main = real_positions.unsqueeze(-1)
+        main_stream_relative_positions = main_stream_relative_positions - real_positions_main
+
+        # predicting stream
+        # input shift
+        real_positions_shift_predicting_stream = real_positions - 1
+        # [B,1, 2*T]
+        predicting_stream_relative_positions = torch.cat((real_positions_shift_predicting_stream, real_positions),
+                                                         dim=-1).unsqueeze(1)
+        # [B,T, 2*T]
+        predicting_stream_relative_positions = predicting_stream_relative_positions.repeat(1, real_positions.size(-1),
+                                                                                           1)
+        # [B,T, 1]
+        real_positions_predicting_stream = real_positions.unsqueeze(-1)
+        predicting_stream_relative_positions = predicting_stream_relative_positions - real_positions_predicting_stream
+        i_buckets_main_stream = self._relative_positions_bucket(main_stream_relative_positions, bidirectional=False)
+        i_bucket_relative_stream = self._relative_positions_bucket(predicting_stream_relative_positions,
+                                                                   bidirectional=False)
+        return i_buckets_main_stream, i_bucket_relative_stream
+
+    def cal_finetune_relative_positions(self, real_positions):
+        n_tokens = real_positions.size(-1)
+        batch_size = real_positions.size(0)
+        if not hasattr(self,
+                       '_finetune_i_bucket_main_stream') or \
+                self._finetune_i_bucket_main_stream is None \
+                or self._finetune_i_bucket_main_stream.device != real_positions.device:
+            fake_positions = torch.arange(1, self.max_target_positions + 1).repeat(1, 1)
+            finetune_i_bucket_main_stream, finetune_i_bucket_predicting_stream = \
+                self.cal_pretrain_relative_positions(fake_positions)
+            self._finetune_i_bucket_main_stream = finetune_i_bucket_main_stream.to(real_positions.device)
+            self._finetune_i_bucket_predicting_stream = finetune_i_bucket_predicting_stream.to(real_positions.device)
+        finetune_i_bucket_main_stream = self._finetune_i_bucket_main_stream[:, :n_tokens, :n_tokens].repeat(batch_size,
+                                                                                                            1, 1)
+        finetune_i_bucket_predicting_stream = torch.cat([
+            self._finetune_i_bucket_predicting_stream[:, :n_tokens, :n_tokens],
+            self._finetune_i_bucket_predicting_stream[:, :n_tokens,
+            self.max_target_positions:self.max_target_positions + n_tokens]
+        ], 2).repeat(batch_size, 1, 1)
+        return finetune_i_bucket_main_stream, finetune_i_bucket_predicting_stream
+
+    def extract_features(self, prev_output_tokens, encoder_out=None, incremental_state=None, **unused):
+        # embed positions
+        # [bos, A, B, C, D, eos] with real positions [1,2,3,4,5,6](main stream), [2,3,4,5,6,7](predicting stream)
+        # target [B,C,D] with prev [A,B,C] from [A,B,C,D] as pretraining span with real positions [2,3,4],
+        # but target actually [3,4,5] for fine tune with another [bos].
+        # thus [2,3,4] used for main stream shifted prev [A,B,C], [3,4,5] used for predicting [B,C,D]
+        if 'positions' in unused:
+            # pretrain procedure
+            main_stream_pos_embed = self.embed_positions._forward(unused['positions'])
+            real_positions = unused['positions']
+            i_buckets_main_stream, i_bucket_relative_stream = \
+                self.cal_pretrain_relative_positions(real_positions)
+        else:
+            # fine tune procedure
+            main_stream_pos_embed, real_positions = self.embed_positions(
+                prev_output_tokens,
+                incremental_state=incremental_state,
+            ) if self.embed_positions is not None else None
+            if incremental_state is not None:
+                i_buckets_main_stream, i_bucket_relative_stream = None, None
+            else:
+                i_buckets_main_stream, i_bucket_relative_stream = \
+                    self.cal_finetune_relative_positions(real_positions)
+
+        predicting_stream_pos_embed = self.embed_positions._forward(real_positions + 1)
+
+        if incremental_state is not None:
+            prev_output_tokens = prev_output_tokens[:, -1:]
+            if main_stream_pos_embed is not None:
+                main_stream_pos_embed = main_stream_pos_embed[:, -1:]
+
+        x = self.embed_tokens(prev_output_tokens)
+        # embed tokens and positions
+        if self.embed_scale is not None:
+            x *= self.embed_scale
+
+        if main_stream_pos_embed is not None:
+            x += main_stream_pos_embed
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+        attn = None
+
+        inner_states = [x]
+        if main_stream_pos_embed is None:
+            print('positions should be used to predict ngrams')
+            raise Exception()
+
+        if self.embed_scale is not None:
+            ngram_input_embed = self.embed_scale * self.ngram_input_embed.weight
+        else:
+            ngram_input_embed = self.ngram_input_embed.weight
+
+        if incremental_state is not None:
+            B = x.size(1)
+            ngram_masks = [
+                (ngram_input_embed[ngram - 1] + predicting_stream_pos_embed).transpose(0, 1).repeat(1, B, 1)
+                for ngram in range(self.ngram)]
+        else:
+            ngram_masks = [(ngram_input_embed[ngram - 1] + predicting_stream_pos_embed).transpose(0, 1) for
+                           ngram in range(self.ngram)]
+
+        self_attn_mask = self.buffered_future_mask(x) if incremental_state is None else None
+        ngram_mask_matrix = self.buffered_future_mask_ngram(x) if incremental_state is None else None
+
+        # TODO in train [(1+ngram)*T, B, C], in inference [T+ngram, B, C]
+        x = torch.cat([x] + ngram_masks, 0)
+
+        if self.emb_layer_norm:
+            x = self.emb_layer_norm(x)
+
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # decoder layers
+        for layer in self.layers:
+            x, attn = layer(
+                x,
+                encoder_out['encoder_out'] if encoder_out is not None else None,
+                encoder_out['encoder_padding_mask'] if encoder_out is not None else None,
+                incremental_state,
+                self_attn_mask=self_attn_mask,
+                ngram_mask_matrix=ngram_mask_matrix,
+                i_buckets_main_stream=i_buckets_main_stream,
+                i_bucket_relative_stream=i_bucket_relative_stream,
+                real_positions=real_positions
+            )
+            inner_states.append(x)
+
+        # TODO [(1+ngram)*T, B, C] -> [B, (1+ngram)*T, C]
+        x_list = x.transpose(0, 1).chunk(1 + self.ngram, 1)
+        if attn is not None:
+            attn_list = attn.transpose(0, 1).chunk(1 + self.ngram, 1)
+        else:
+            attn_list = None
+
+        return x_list, {'attn': attn_list}
+
+    def get_normalized_probs(self, net_output, log_probs, sample):
+        """Get normalized probabilities (or log probs) from a net's output."""
+
+        if hasattr(self, 'adaptive_softmax') and self.adaptive_softmax is not None:
+            if sample is not None:
+                assert 'target' in sample
+                target = sample['target']
+            else:
+                target = None
+            out = self.adaptive_softmax.get_log_prob(net_output[0], target=target)
+            return out.exp_() if not log_probs else out
+        '''
+        logits_list = net_output[0]
+        if log_probs:
+            return [utils.log_softmax(logits, dim=-1, onnx_trace=self.onnx_trace) for logits in logits_list][0]
+        else:
+            return [utils.softmax(logits, dim=-1, onnx_trace=self.onnx_trace) for logits in logits_list][0]
+        '''
+        logits = net_output[0]
+        if log_probs:
+            return utils.log_softmax(logits, dim=-1, onnx_trace=self.onnx_trace)
+        else:
+            return utils.softmax(logits, dim=-1, onnx_trace=self.onnx_trace)
+        
+
+    def output_layer(self, features, **kwargs):
+        """Project features to the vocabulary size."""
+        # project back to size of vocabulary
+        if self.share_input_output_embed:
+            return F.linear(features, self.embed_tokens.weight)
+        else:
+            return F.linear(features, self.embed_out)
+
+    def max_positions(self):
+        """Maximum output length supported by the decoder."""
+        if self.embed_positions is None:
+            return self.max_target_positions
+        return min(self.max_target_positions, self.embed_positions.max_positions())
+
+    def buffered_future_mask(self, tensor):
+        dim = tensor.size(0)
+        if not hasattr(self,
+                       '_future_mask') or self._future_mask is None or self._future_mask.device != tensor.device or self._future_mask.size(
+            0) < dim:
+            self._future_mask = torch.triu(utils.fill_with_neg_inf(tensor.new(dim, dim)), 1)
+        return self._future_mask[:dim, :dim]
+
+    def buffered_future_mask_ngram(self, tensor):
+        dim = tensor.size(0)
+        if not hasattr(self,
+                       '_ngram_future_mask') or self._ngram_future_mask is None or self._ngram_future_mask.device != tensor.device:
+            self._ngram_future_mask = ngram_attention_bias(self.max_target_positions, self.ngram).type(tensor.dtype).to(
+                tensor.device)
+        ngram_future_mask = torch.cat([self._ngram_future_mask[:, :dim, :dim],
+                                       self._ngram_future_mask[:, :dim,
+                                       self.max_target_positions: self.max_target_positions + dim]
+                                       ], 2)
+        return ngram_future_mask
+
+
+def Embedding(num_embeddings, embedding_dim, padding_idx):
+    m = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
+    nn.init.normal_(m.weight, mean=0, std=embedding_dim ** -0.5)
+    nn.init.constant_(m.weight[padding_idx], 0)
+    return m
+
+
+def Linear(in_features, out_features, bias=True):
+    m = nn.Linear(in_features, out_features, bias)
+    nn.init.xavier_uniform_(m.weight)
+    if bias:
+        nn.init.constant_(m.bias, 0.)
+    return m
 
 class NgramTransformerDecoder(FairseqIncrementalDecoder):
     """
@@ -940,3 +1778,4 @@ def transformer_big(args):
     args.encoder_layers = getattr(args, 'encoder_layers', 12)
     args.decoder_layers = getattr(args, 'decoder_layers', 12)
     transformer_middle(args)
+
