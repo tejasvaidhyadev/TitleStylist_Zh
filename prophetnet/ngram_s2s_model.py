@@ -607,8 +607,6 @@ class NgramTransformermixDecoderLayer(nn.Module):
         # Initialize blocks
         self.activation_fn = utils.get_activation_fn(activation_fn)
         self.ngram = ngram
-                    activation=getattr(args, 'activation_fn', 'relu')
-        )
         self.activation_dropout = getattr(args, 'activation_dropout', 0)
         if self.activation_dropout == 0:
             # for backwards compatibility with models that use args.relu_dropout
